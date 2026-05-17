@@ -985,6 +985,16 @@ run_simulation <- function(population_type, n_trials) {
   MRL_unified_vec <- numeric(n_trials)
   total_ef_vec    <- numeric(n_trials)
   bioavail_vec    <- numeric(n_trials)
+  feeding_rate_vec <- numeric(n_trials)
+
+  # Diagnostic records for post-simulation validation (one row per trial x tissue)
+  n_rec      <- n_trials * length(tissues)
+  rec_trial  <- integer(n_rec)
+  rec_tissue <- character(n_rec)
+  rec_bw     <- numeric(n_rec)
+  rec_fi     <- numeric(n_rec)
+  rec_tf     <- numeric(n_rec)
+  rec_i      <- 0L
 
   # Pre-extract BW and FI parameters
   bw_params <- list()
@@ -1030,6 +1040,7 @@ run_simulation <- function(population_type, n_trials) {
       tf_val <- if (config$use_tf_uncertainty) sample_tf(tissue) else TF_cattle[[tissue]]$mean
 
       tissue_age_sum <- 0
+      fi_recorded    <- NA_real_
       for (age_group in age_groups) {
         ed_val <- ED_age[[age_group]]
         if (is.null(ed_val) || ed_val == 0) next
@@ -1044,7 +1055,19 @@ run_simulation <- function(population_type, n_trials) {
         )
         # Age-weighted: (IR_age / 1000) * ED_age / (BW_age * LT)
         tissue_age_sum <- tissue_age_sum + (fi_val / 1000) * ed_val / (bw_val * LT)
+        fi_recorded    <- fi_val   # capture for validation (Adult-only)
       }
+
+      # Diagnostic record, one row per trial x tissue. TF and BW are always
+      # sampled; FI is NA for tissues with no consumption data (liver and
+      # kidney have zero reported cattle intake in the Taiwan dataset).
+      rec_i <- rec_i + 1L
+      rec_trial[rec_i]  <- trial
+      rec_tissue[rec_i] <- tissue
+      rec_bw[rec_i]     <- bw_sampled[[age_groups[1]]]
+      rec_fi[rec_i]     <- fi_recorded
+      rec_tf[rec_i]     <- tf_val
+
       total_ef <- total_ef + tf_val * feeding_rate * bioavailability * tissue_age_sum
     }
 
@@ -1057,19 +1080,30 @@ run_simulation <- function(population_type, n_trials) {
       MRL_skin_vec[trial] <- NA; MRL_lung_vec[trial] <- NA
       MRL_bladder_vec[trial] <- NA; MRL_unified_vec[trial] <- NA
     }
-    total_ef_vec[trial] <- total_ef
-    bioavail_vec[trial] <- bioavailability
+    total_ef_vec[trial]     <- total_ef
+    bioavail_vec[trial]     <- bioavailability
+    feeding_rate_vec[trial] <- feeding_rate
   }
 
-  data.frame(
-    trial       = 1:n_trials,
-    MRL_skin    = MRL_skin_vec,
-    MRL_lung    = MRL_lung_vec,
-    MRL_bladder = MRL_bladder_vec,
-    MRL_unified = MRL_unified_vec,
-    total_ef    = total_ef_vec,
-    bioavail    = bioavail_vec
+  results <- data.frame(
+    trial        = 1:n_trials,
+    MRL_skin     = MRL_skin_vec,
+    MRL_lung     = MRL_lung_vec,
+    MRL_bladder  = MRL_bladder_vec,
+    MRL_unified  = MRL_unified_vec,
+    total_ef     = total_ef_vec,
+    bioavail     = bioavail_vec,
+    feeding_rate = feeding_rate_vec
   )
+  # Attach trial x tissue diagnostic records (BW, FI, TF) for validation
+  attr(results, "diag") <- data.frame(
+    trial  = rec_trial[seq_len(rec_i)],
+    tissue = rec_tissue[seq_len(rec_i)],
+    bw     = rec_bw[seq_len(rec_i)],
+    fi     = rec_fi[seq_len(rec_i)],
+    tf     = rec_tf[seq_len(rec_i)]
+  )
+  results
 }
 
 
@@ -1142,9 +1176,135 @@ sensitivity_results <- data.frame(
 ) |> mutate(Abs_Corr = abs(Correlation)) |> arrange(desc(Abs_Corr))
 
 
-## C11. MRL plots --------------------------------------------------------------
+## C11. Post-simulation validation --------------------------------------------
+# Verifies the mathematical / structural integrity of the Monte Carlo run.
+# Two categories:
+#   (1) Pearson r(BW, FI) per tissue vs the target correlation (0.50)
+#   (2) Distributional integrity: a one-sample Kolmogorov-Smirnov test
+#       comparing each Monte Carlo-sampled input to the distribution it was
+#       DRAWN from (its intended target) - truncated-normal for TF and feeding
+#       rate, uniform for bioavailability. This confirms the sampler reproduced
+#       the intended distributions, rather than testing against plain normality
+#       (TF is a truncated normal by construction).
+# Performed on the general-public run.
 
-cat("C6. Creating MRL plots...\n")
+cat("C6. Post-simulation validation (general public)...\n")
+diag_gp <- attr(results_general, "diag")
+
+# (1) BW-FI Pearson correlation per tissue ------------------------------------
+# Liver and kidney have zero reported cattle intake (FI = NA) -> no correlation.
+val_corr <- do.call(rbind, lapply(tissues, function(tis) {
+  s  <- diag_gp[diag_gp$tissue == tis, ]
+  ok <- is.finite(s$bw) & is.finite(s$fi)
+  data.frame(tissue = tis, n = sum(ok),
+             r_pearson = if (sum(ok) >= 3)
+               cor(s$bw[ok], s$fi[ok], method = "pearson") else NA_real_,
+             stringsAsFactors = FALSE)
+}))
+cat(sprintf("    (1) BW-FI Pearson correlation (target r = %.2f):\n",
+            config$target_correlation))
+for (i in seq_len(nrow(val_corr))) {
+  if (is.na(val_corr$r_pearson[i]))
+    cat(sprintf("        %-8s no consumption data (FI = 0)\n",
+                val_corr$tissue[i]))
+  else
+    cat(sprintf("        %-8s r = %.3f  (n = %d)\n",
+                val_corr$tissue[i], val_corr$r_pearson[i], val_corr$n[i]))
+}
+
+# (2) Distributional integrity vs intended target ----------------------------
+# One-sample KS test against the exact distribution each input was drawn from.
+# The KS D statistic (max CDF deviation) is the primary metric; at n = 10000
+# the p-value is sensitive to ordinary sampling noise and is secondary.
+ks_target <- function(x, cdf, ...) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3) return(data.frame(D = NA_real_, p_value = NA_real_))
+  k <- suppressWarnings(ks.test(x, cdf, ...))
+  data.frame(D = unname(k$statistic), p_value = k$p.value)
+}
+
+# (2a) TF vs intended truncated-normal target (a = q025, b = q975)
+val_tf <- do.call(rbind, lapply(tissues, function(tis) {
+  tf  <- TF_cattle[[tis]]
+  esd <- (tf$q975 - tf$q025) / 3.92          # same SD that sample_tf() uses
+  k   <- ks_target(diag_gp$tf[diag_gp$tissue == tis], "ptruncnorm",
+                   a = tf$q025, b = tf$q975, mean = tf$mean, sd = esd)
+  data.frame(variable = paste0("TF_", tis), target = "truncated normal",
+             D = k$D, p_value = k$p_value, stringsAsFactors = FALSE)
+}))
+
+# (2b) Feeding rate vs intended truncated-normal target (a = 0)
+k_fr <- ks_target(results_general$feeding_rate, "ptruncnorm",
+                  a = 0, b = Inf, mean = feeding_rate_params$mean,
+                  sd = feeding_rate_params$sd)
+val_fr <- data.frame(variable = "Feeding_rate", target = "truncated normal",
+                     D = k_fr$D, p_value = k_fr$p_value, stringsAsFactors = FALSE)
+
+# (2c) Bioavailability vs intended uniform target
+k_bio <- ks_target(results_general$bioavail, "punif",
+                   min = config$bioavail_min, max = config$bioavail_max)
+val_bio <- data.frame(variable = "Bioavailability", target = "uniform",
+                      D = k_bio$D, p_value = k_bio$p_value, stringsAsFactors = FALSE)
+
+val_dist <- rbind(val_tf, val_fr, val_bio)
+cat("    (2) Distributional integrity - KS test vs intended target (small D = match):\n")
+for (i in seq_len(nrow(val_dist)))
+  cat(sprintf("        %-16s vs %-18s D = %.4f, p = %.4f\n",
+              val_dist$variable[i], val_dist$target[i],
+              val_dist$D[i], val_dist$p_value[i]))
+cat(sprintf("        -> max D = %.4f across all sampled inputs\n",
+            max(val_dist$D, na.rm = TRUE)))
+
+# Feeding-rate target check (mean / SD)
+cat(sprintf("        Feeding rate: mean = %.3f (target %.2f), SD = %.3f (target %.2f)\n",
+            mean(results_general$feeding_rate), feeding_rate_params$mean,
+            sd(results_general$feeding_rate),   feeding_rate_params$sd))
+
+# Export validation summary --------------------------------------------------
+val_out <- rbind(
+  data.frame(Category = "BW-FI correlation", Variable = val_corr$tissue,
+             Metric = "Pearson r", Value = round(val_corr$r_pearson, 4),
+             P_value = NA_real_,
+             Reference = sprintf("target r = %.2f", config$target_correlation),
+             stringsAsFactors = FALSE),
+  data.frame(Category = "Distributional integrity", Variable = val_dist$variable,
+             Metric = paste0("KS D vs ", val_dist$target),
+             Value = round(val_dist$D, 4),
+             P_value = round(val_dist$p_value, 4),
+             Reference = "small D = matches intended target",
+             stringsAsFactors = FALSE)
+)
+write.csv(val_out, out_path("C_validation_summary.csv"), row.names = FALSE)
+
+# Validation figure: BW-FI scatter (only tissues with consumption data) -------
+diag_fi    <- diag_gp[is.finite(diag_gp$fi), ]
+fi_tissues <- intersect(tissues, unique(diag_fi$tissue))
+diag_fi$tissue <- factor(diag_fi$tissue, levels = fi_tissues)
+lab_df <- data.frame(
+  tissue = factor(val_corr$tissue[!is.na(val_corr$r_pearson)], levels = fi_tissues),
+  label  = sprintf("r = %.3f", val_corr$r_pearson[!is.na(val_corr$r_pearson)])
+)
+p_val <- ggplot(diag_fi, aes(bw, fi)) +
+  geom_point(alpha = 0.08, size = 0.4, colour = "#4393c3") +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+              colour = "firebrick", linewidth = 0.8) +
+  geom_text(data = lab_df, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.15, vjust = 1.6, size = 3.8, fontface = "bold",
+            inherit.aes = FALSE) +
+  facet_wrap(~tissue, scales = "free_y") +
+  labs(title = sprintf("BW-FI correlation by tissue (target r = %.2f)",
+                       config$target_correlation),
+       subtitle = "General public; red line = linear fit. Liver and kidney omitted (zero reported intake).",
+       x = "Body weight (kg)", y = "Food intake (g/day)") +
+  theme_bw(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+ggsave(out_path("C5_BW_FI_correlation.png"), p_val,
+       width = 9, height = 4.5, dpi = 300)
+
+
+## C12. MRL plots --------------------------------------------------------------
+
+cat("C7. Creating MRL plots...\n")
 
 plot_data <- rbind(
   data.frame(Population = "General Public", MRL_unified = results_general$MRL_unified),
@@ -1217,9 +1377,9 @@ ggsave(out_path("C4_sensitivity_tornado.png"),
        pC4, width = 8, height = 4, dpi = 300, bg = "white")
 
 
-## C12. Export CSV tables ------------------------------------------------------
+## C13. Export CSV tables ------------------------------------------------------
 
-cat("C7. Exporting tables and summary...\n")
+cat("C8. Exporting tables and summary...\n")
 
 write.csv(results_general,  out_path("C_results_general_public.csv"), row.names = FALSE)
 write.csv(results_consumer, out_path("C_results_consumer_only.csv"),  row.names = FALSE)
@@ -1263,7 +1423,7 @@ table4 <- data.frame(
 write.csv(table4, out_path("C_Table4_MRL_by_endpoint.csv"), row.names = FALSE)
 
 
-## C13. Final console summary --------------------------------------------------
+## C14. Final console summary --------------------------------------------------
 
 cat("\n", strrep("=", 65), "\n", sep = "")
 cat("FINAL INTEGRATED-PIPELINE SUMMARY (Adult-only)\n")
