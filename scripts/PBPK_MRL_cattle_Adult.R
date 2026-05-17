@@ -1463,9 +1463,11 @@ ga_arrow <- function() {
 ga_n_pbpk    <- format(n_runs_pbpk, big.mark = ",")
 ga_n_mc      <- format(config$n_sim, big.mark = ",")
 ga_feed_rate <- unname(parms["feed_intake_kg"])
-ga_mrl       <- round(final_MRL, 1)
-ga_fold_eu   <- round(2000  / ga_mrl)
-ga_fold_nrc  <- round(30000 / ga_mrl)
+ga_mrl      <- round(final_MRL, 1)
+# Current international tAs feed MRLs span 2,000-30,000 ug/kg
+# (CFIA 2015; EU 2019; FSANZ 2001; U.S. NRC 2005)
+ga_fold_lo  <- round(2000  / ga_mrl)
+ga_fold_hi  <- round(30000 / ga_mrl)
 
 # --- Panel 1: Feed input ---
 p_feed <- ga_canvas(ga_feed_c) +
@@ -1605,14 +1607,15 @@ p_mrl <- ga_canvas(ga_mrl_c) +
            size = 2.5, color = ga_sub) +
   annotate("segment", x = 1.5, xend = 8.5, y = 4.0, yend = 4.0,
            color = "#CCCCCC", linewidth = 0.4) +
-  annotate("text", x = 5, y = 3.3, label = "vs. Current tAs MRLs",
+  annotate("text", x = 5, y = 3.3, label = "vs. Current tAs feed MRLs",
            size = 2.6, fontface = "bold", color = ga_text) +
-  annotate("text", x = 5, y = 2.1,
-           label = sprintf("EU:  2,000 µg/kg  (%d×)", ga_fold_eu),
-           size = 2.3, color = ga_sub) +
-  annotate("text", x = 5, y = 1.0,
-           label = sprintf("NRC:  30,000 µg/kg  (%d×)", ga_fold_nrc),
-           size = 2.3, color = ga_sub)
+  annotate("text", x = 5, y = 2.2, label = "2,000–30,000 µg/kg",
+           size = 2.5, color = ga_sub) +
+  annotate("text", x = 5, y = 1.2,
+           label = sprintf("%s–%s× higher",
+                           format(ga_fold_lo, big.mark = ","),
+                           format(ga_fold_hi, big.mark = ",")),
+           size = 2.6, fontface = "bold", color = ga_red)
 
 # --- Title / footer banners ---
 p_ga_title <- ggplot() +
