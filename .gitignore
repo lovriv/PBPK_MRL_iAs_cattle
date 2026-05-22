@@ -23,4 +23,4 @@ desktop.ini
 
 # Log files
 *.log
-run_log.txt
+run_log*.txt

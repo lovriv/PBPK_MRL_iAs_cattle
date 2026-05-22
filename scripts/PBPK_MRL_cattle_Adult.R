@@ -491,13 +491,41 @@ parm_samples <- do.call(cbind, lapply(pop_dist, function(d) {
 colnames(parm_samples) <- names(pop_dist)
 parms_fixed <- parms[!names(parms) %in% names(pop_dist)]
 
+# --- Per-animal feed intake correlated with cattle body weight (r = 0.5) -----
+# FR_feed ~ truncated normal(9.42, 0.94) kg DM/day (Waegeneers et al. 2011),
+# truncated at mean +/- 3 SD. Correlation with cattle BW imposed via a Gaussian
+# z-score combination, matching the consumer-side scheme used in Part C. The
+# iAs dose per animal is then proportional to its sampled FR_feed.
+target_corr_cattle <- 0.5
+fr_mean <- 9.42; fr_sd <- 0.94
+fr_lo   <- fr_mean - 3 * fr_sd
+fr_hi   <- fr_mean + 3 * fr_sd
+set.seed(4730)
+z_bw   <- (parm_samples[, "BW"] - unname(pop_dist$BW["mean"])) /
+          unname(pop_dist$BW["sd"])
+eps    <- rnorm(n_runs_pbpk)
+z_fr   <- target_corr_cattle * z_bw + sqrt(1 - target_corr_cattle^2) * eps
+fr_raw <- fr_mean + z_fr * fr_sd
+parm_samples <- cbind(parm_samples,
+                      FR_feed = pmin(pmax(fr_raw, fr_lo), fr_hi))
+cat(sprintf("    Imposed cattle Pearson r(BW, FR_feed) = %.3f (target = %.2f)\n",
+            cor(parm_samples[, "BW"], parm_samples[, "FR_feed"]),
+            target_corr_cattle))
+
 
 ## A8. Single-run wrapper ------------------------------------------------------
 
 run_one_pop <- function(i) {
   p_i   <- parm_samples[i, ]
+  FR_i  <- unname(p_i["FR_feed"])
   d_i   <- compute_derived(p_i)
   all_p <- c(parms_fixed, p_i, d_i)
+  # iAs dose proportional to this animal's feed intake (Hung 2021 control split:
+  # AsIII 14.3, AsV 89.0, MMA 14.4, DMA 1.8 ug/kg DM)
+  all_p["PdoseC_AsIII"] <- FR_i * 14.3
+  all_p["PdoseC_AsV"]   <- FR_i * 89.0
+  all_p["PdoseC_MMA"]   <- FR_i * 14.4
+  all_p["PdoseC_DMA"]   <- FR_i * 1.8
   tryCatch({
     out_i <- deSolve::ode(
       y = y0, times = times, func = pbpk_cattle_ode,
@@ -507,6 +535,7 @@ run_one_pop <- function(i) {
     data.frame(
       run          = i,
       time         = df_i$time,
+      FR_feed      = FR_i,
       C_iAs_muscle = (df_i$AMT_AsIII_muscle + df_i$AMT_AsV_muscle) / all_p["V_muscle"],
       C_iAs_liv    = (df_i$AMT_AsIII_liv    + df_i$AMT_AsV_liv)    / all_p["V_liv"],
       C_iAs_kid    = (df_i$AMT_AsIII_kid    + df_i$AMT_AsV_kid)    / all_p["V_kid"]
@@ -555,9 +584,9 @@ pop_df_conv <- pop_df |>
     BTF_muscle      = C_iAs_muscle_ug / C_feed_iAs_ug_kg,
     BTF_liv         = C_iAs_liv_ug    / C_feed_iAs_ug_kg,
     BTF_kid         = C_iAs_kid_ug    / C_feed_iAs_ug_kg,
-    TF_muscle       = BTF_muscle / feed_intake_kg,
-    TF_liv          = BTF_liv    / feed_intake_kg,
-    TF_kid          = BTF_kid    / feed_intake_kg
+    TF_muscle       = BTF_muscle / FR_feed,
+    TF_liv          = BTF_liv    / FR_feed,
+    TF_kid          = BTF_kid    / FR_feed
   )
 
 
